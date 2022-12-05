@@ -81,5 +81,26 @@ envoy中XDS主要分为Sotw和Delta两种形式，本部分先讲解Sotw相关�
 
 ![](./images/xds.png)
 
+## XDS接口
+
+xDS的接口比较简单，无论是CDS、EDS、LDS、RDS等，接口是一样的，由三个方法组成：
+
+```c++
+1、rpc StreamEndpoints(stream discovery.v3.DiscoveryRequest) returns (stream discovery.v3.DiscoveryResponse)
+
+2、rpc DeltaEndpoints(stream discovery.v3.DeltaDiscoveryRequest) returns (stream discovery.v3.DeltaDiscoveryResponse)
+
+3、rpc FetchEndpoints(discovery.v3.DiscoveryRequest) returns (discovery.v3.DiscoveryResponse)
+```
+例如https://github.com/envoyproxy/envoy/blob/master/api/envoy/service/endpoint/v3/eds.proto
+
+接口虽然简单，但DiscoveryRequest、DiscoveryResponse资源格式灵活且复杂。具体来说如下：
+
+![](./images/discover.png)
+
+## 总结
+
+本篇文章主要介绍支持Sotw协议时，envoy中所实现的XDS相关的架构。
+
 
 
