@@ -396,3 +396,45 @@ AsyncClient(RawAsyncClientPtr&& client) : client_(std::move(client)) {}
 其初始化过程汇总如下
 
 ![](./images/xds4.png)
+
+## 请求流程
+
+本文以CDS为例讲解Sotw协议在envoy中的实现，上述讲解了CDS的初始化流程，本部分主要讲解CDS如何触发grpc stream向XDS server发送请求以及解析服务。
+
+在source/common/upstream/cluster_manager_impl.cc文件的ClusterManagerInitHelper::maybeFinishInitialize()函数中有如下代码实现
+
+```c++
+if (state_ == State::WaitingToStartSecondaryInitialization && cds_) {
+    ENVOY_LOG(info, "cm init: initializing cds");
+    state_ = State::WaitingToStartCdsInitialization;
+    cds_->initialize();
+  } 
+```
+
+关于Cluster初始化不是本文讲解的主题，因此跳过。上述代码中会调用
+
+```c++
+cds_->initialize();
+```
+其实现位于source/common/upstream/cds_api_impl.h，实现如下
+
+```c++
+void initialize() override { subscription_->start({}); }
+```
+
+上述会调用位于source/common/config/grpc_subscription_impl.cc中的GrpcSubscriptionImpl::start接口，其实现如下所示
+
+```c++
+void GrpcSubscriptionImpl::start(const std::set<std::string>& resources) {
+  // ..........
+  watch_ = grpc_mux_->addWatch(type_url_, resources, *this, resource_decoder_);
+  // .....
+  // ADS initial request batching relies on the users of the GrpcMux *not* calling start on it,
+  // whereas non-ADS xDS users must call it themselves.
+  if (!is_aggregated_) {
+    grpc_mux_->start();
+  }
+}
+```
+
+上述实现中，首先调用GrpcMuxImpl的addWatch接口，用来初始化GrpcSubscriptionImpl的watch_成员变量。
