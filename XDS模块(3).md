@@ -178,24 +178,158 @@ const std::string& system_version_info) override;
 即一个GrpcMux维护一个Map，key为type_Url, 例如type.googleapis.com/envoy.config.cluster.v3.Cluster，value为对应的ApiState。而ApiState里维护着WatchList，每个Watch维护一组resource name和对应这些资源变更的回调函数。
 
 
+## 源码讲解
 
+### cds api初始化
 
+在source/common/upstream/cluster_manager_impl.cc的ClusterManagerImpl::ClusterManagerImpl构造函数中有如下实现
 
+```c++
+// We can now potentially create the CDS API once the backing cluster exists.
+  if (dyn_resources.has_cds_config()) {
+    cds_api_ = factory_.createCds(dyn_resources.cds_config(), *this);
+    init_helper_.setCds(cds_api_.get());
+  }
+```
+上述createCds接口的调用时序图如下所示
+![](./images/cdsinit.png)
 
+## XDS核心逻辑初始化
 
+本部分讲解Sotw协议变体时，envoy中xds相关的核心实现，也即CdsApiImpl中subscription_的初始化。
 
+subscription_的初始化时刻在CdsApiImpl的构造函数中，其位于source/common/upstream/cds_api_impl.cc，有如下实现
 
+```c++
+subscription_ = cm_.subscriptionFactory().subscriptionFromConfigSource(
+      cds_config, Grpc::Common::typeUrl(resource_name), *scope_, *this, resource_decoder_);
+```
 
+上述cm_.subscriptionFactory().subscriptionFromConfigSource接口会调用 位于source/common/config/subscription_factory_impl.cc中的SubscriptionFactoryImpl::subscriptionFromConfigSource接口，
 
+该函数接口声明如下
+```c++
+SubscriptionPtr SubscriptionFactoryImpl::subscriptionFromConfigSource(
+    const envoy::config::core::v3::ConfigSource& config, absl::string_view type_url,
+    Stats::Scope& scope, SubscriptionCallbacks& callbacks,
+    OpaqueResourceDecoder& resource_decoder)
+```
 
+上述参数说明如下：
+**config:** 配置文件中的ConfigSource配置选项
 
- | 
+**type_url:** 资源类型，其构造过程在CdsApiImpl构造函数中，具体实现如下
 
+```c++
+const auto resource_name = getResourceName();
+Grpc::Common::typeUrl(resource_name);
+```
 
+**callbacks:** 该callbacks即为CdsApiImpl
 
+回到SubscriptionFactoryImpl::subscriptionFromConfigSource函数，该函数有如下实现，负责初始化相应的**GrpcSubscriptionImpl实例 以及其grpc_mux_成员变量等**
 
+```c++
+switch (api_config_source.api_type()) {
+    case envoy::config::core::v3::ApiConfigSource::hidden_envoy_deprecated_UNSUPPORTED_REST_LEGACY:
+      throw EnvoyException(
+          "REST_LEGACY no longer a supported ApiConfigSource. "
+          "Please specify an explicit supported api_type in the following config:\n" +
+          config.DebugString());
+    case envoy::config::core::v3::ApiConfigSource::REST:
+      ..........
+    // Sotw+grpc
+    case envoy::config::core::v3::ApiConfigSource::GRPC:
+      return std::make_unique<GrpcSubscriptionImpl>(
+          std::make_shared<Config::GrpcMuxImpl>(
+              local_info_,
+              Utility::factoryForGrpcApiConfigSource(cm_.grpcAsyncClientManager()，api_config_source, scope, true)
+                  ->create(),
+              dispatcher_, sotwGrpcMethod(type_url, api_config_source.transport_api_version()),
+              api_config_source.transport_api_version(), random_, scope,
+              Utility::parseRateLimitSettings(api_config_source),
+              api_config_source.set_node_on_first_message_only()),
+          callbacks, resource_decoder, stats, type_url, dispatcher_,
+          Utility::configSourceInitialFetchTimeout(config),
+          /*is_aggregated*/ false);
+    case envoy::config::core::v3::ApiConfigSource::DELTA_GRPC: ...........
+    default:
+      NOT_REACHED_GCOVR_EXCL_LINE;
+```
+上述实现会初始化GrpcSubscriptionImpl实例，GrpcSubscriptionImpl 的构造函数位于source/common/config/grpc_subscription_impl.h，其声明如下所示
 
+```c++
+GrpcSubscriptionImpl(GrpcMuxSharedPtr grpc_mux, SubscriptionCallbacks& callbacks,
+                       OpaqueResourceDecoder& resource_decoder, SubscriptionStats stats,
+                       absl::string_view type_url, Event::Dispatcher& dispatcher,
+                       std::chrono::milliseconds init_fetch_timeout, bool is_aggregated);
+```
 
+参数说明:
 
-|
+**grpc_mux:** 用来除初始化GrpcSubscriptionImpl的grpc_mux_成员
 
+**callbacks:** 也即CdsApiImpl
+
+grpc_mux_成员变量的初始化语句为：
+
+```c++
+std::make_shared<Config::GrpcMuxImpl>(
+              local_info_,
+              Utility::factoryForGrpcApiConfigSource(cm_.grpcAsyncClientManager(),
+                api_config_source, scope, true)
+                  ->create(),
+              dispatcher_, sotwGrpcMethod(type_url,api_config_source.transport_api_version())
+```
+
+Config::GrpcMuxImpl的构造函数位于source/common/config/grpc_mux_impl.h，其声明如下
+
+```c++
+GrpcMuxImpl(const LocalInfo::LocalInfo& local_info, Grpc::RawAsyncClientPtr async_client,
+              Event::Dispatcher& dispatcher, const Protobuf::MethodDescriptor& service_method,
+              envoy::config::core::v3::ApiVersion transport_api_version,
+              Runtime::RandomGenerator& random, Stats::Scope& scope,
+              const RateLimitSettings& rate_limit_settings, bool skip_subsequent_node);
+```
+
+参数说明：
+
+**async_client:** 主要用来初始化其成员grpc_stream_
+
+async_client的初始化语句为：
+```c++
+Utility::factoryForGrpcApiConfigSource(cm_.grpcAsyncClientManager(),api_config_source, scope, true)
+                  ->create()
+```
+该接口行为如下
+- 调用位于source/common/grpc/async_client_manager_impl.cc中的AsyncClientManagerImpl::factoryForGrpcService接口，生成相应的AsyncClientFactoryImpl实例，
+
+- 调用AsyncClientFactoryImpl::create接口，创建位于source/common/grpc/async_client_impl.h的 AsyncClientImpl实例
+
+**service_method:** Protobuf::MethodDescriptor类，主要用来构造grpc的http2请求，具体可参考[grpc over http2](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)
+
+该参数的初始化语句为
+```c++
+sotwGrpcMethod(type_url, api_config_source.transport_api_version())
+```
+上述接口位于source/common/config/type_to_endpoint.cc，其实现如下
+```c++
+const Protobuf::MethodDescriptor&
+sotwGrpcMethod(absl::string_view type_url,
+               envoy::config::core::v3::ApiVersion transport_api_version) {
+  const auto it = typeUrlToVersionedServiceMap().find(static_cast<TypeUrl>(type_url));
+  ASSERT(it != typeUrlToVersionedServiceMap().cend());
+  return *Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
+      it->second.sotw_grpc_.methods_[effectiveTransportApiVersion(transport_api_version)]);
+}
+```
+在typeUrlToVersionedServiceMap()接口中会将所有的xDS method的name进行注册，具体注册接口流程可参见
+```c++
+TypeUrlToVersionedServiceMap* buildTypeUrlToServiceMap()
+```
+Protobuf::DescriptorPool::generated_pool()，该接口的功能可参考[generated_pool](https://developers.google.com/protocol-buffers/docs/reference/cpp/google.protobuf.descriptor#DescriptorPool.generated_pool.details)
+
+[FindMethodByName](https://developers.google.com/protocol-buffers/docs/reference/cpp/google.protobuf.descriptor)
+
+---------------------
+回到GrpcMuxImpl初始化
