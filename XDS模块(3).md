@@ -438,3 +438,181 @@ void GrpcSubscriptionImpl::start(const std::set<std::string>& resources) {
 ```
 
 上述实现中，首先调用GrpcMuxImpl的addWatch接口，用来初始化GrpcSubscriptionImpl的watch_成员变量。
+
+watch_成员是一个GrpcMuxWatchImpl实例，其实例化过程在addWatch接口中，其具体实现如下
+
+```c++
+
+GrpcMuxWatchPtr GrpcMuxImpl::addWatch(const std::string& type_url,
+                                      const std::set<std::string>& resources,
+                                      SubscriptionCallbacks& callbacks,
+                                      OpaqueResourceDecoder& resource_decoder) {
+  auto watch =
+      std::make_unique<GrpcMuxWatchImpl>(resources, callbacks, resource_decoder, type_url, *this);
+  ENVOY_LOG(debug, "gRPC mux addWatch for " + type_url);
+
+  // Lazily kick off the requests based on first subscription. This has the
+  // convenient side-effect that we order messages on the channel based on
+  // Envoy's internal dependency ordering.
+  // TODO(gsagula): move TokenBucketImpl params to a config.
+  if (!api_state_[type_url].subscribed_) {
+    api_state_[type_url].request_.set_type_url(type_url);
+    api_state_[type_url].request_.mutable_node()->MergeFrom(local_info_.node());
+    api_state_[type_url].subscribed_ = true;
+    subscriptions_.emplace_back(type_url);
+  }
+
+  // This will send an updated request on each subscription.
+  // TODO(htuch): For RDS/EDS, this will generate a new DiscoveryRequest on each resource we added.
+  // Consider in the future adding some kind of collation/batching during CDS/LDS updates so that we
+  // only send a single RDS/EDS update after the CDS/LDS update.
+  queueDiscoveryRequest(type_url);
+
+  return watch;
+}
+
+```
+
+上述函数做了如下工作
+
+- 创建GrpcMuxWatchImpl
+
+- 初始化api_state_ map,其key为type_url
+
+- 将request入队列
+
+先具体看一下创建GrpcMuxWatchImpl的过程，其构造函数如下
+
+```c++
+GrpcMuxWatchImpl(const std::set<std::string>& resources, SubscriptionCallbacks& callbacks,
+                     OpaqueResourceDecoder& resource_decoder, const std::string& type_url,
+                     GrpcMuxImpl& parent)
+        : resources_(resources), callbacks_(callbacks), resource_decoder_(resource_decoder),
+          type_url_(type_url), parent_(parent), watches_(parent.api_state_[type_url].watches_) {
+      // 将this，也即本Watch插入到api_state_相应的列表中
+      watches_.emplace(watches_.begin(), this);
+    }
+```
+
+上述watches_成员变量为api_states_中相应资源对应的watches_的引用，然后在将该GrpcMuxWatchImpl插入到订阅相应资源的watches_列表中。
+
+初始化时，resources_为空，通过[xDS REST and gRPC protocol](https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol#basic-protocol-overview)可知，
+
+> For example, in SotW:
+> Client sends a request with resource_names unset. Server interprets this as a subscription to *.
+
+queueDiscoveryRequest接口的实现如下
+
+```c++
+void GrpcMuxImpl::queueDiscoveryRequest(const std::string& queue_item) {
+  request_queue_.push(queue_item);
+  drainRequests();
+}
+```
+
+drainRequests接口实现如下
+
+```c++
+void GrpcMuxImpl::drainRequests() {
+  while (!request_queue_.empty() && grpc_stream_.checkRateLimitAllowsDrain()) {
+    // Process the request, if rate limiting is not enabled at all or if it is under rate limit.
+    sendDiscoveryRequest(request_queue_.front());
+    request_queue_.pop();
+  }
+  grpc_stream_.maybeUpdateQueueSizeStat(request_queue_.size());
+}
+```
+
+由于此时grpc_stream_还未和server建立连接，故此时request还在队列中。
+
+回到GrpcSubscriptionImpl::start接口中，在创建watch_成功后，会调用grpc_mux_的start接口，也即
+
+```c++
+void GrpcMuxImpl::start() { grpc_stream_.establishNewStream(); }
+```
+
+上述接口会调用grpc_stream_的establishNewStream()创建和server的连接，其实现如下
+
+```c++
+void establishNewStream() {
+    // .......
+    stream_ = async_client_->start(service_method_, *this, Http::AsyncClient::StreamOptions());
+    // ....
+    callbacks_->onStreamEstablished();
+  }
+```
+
+关于async_client_创建stream_成员变量的过程本文不再讲解，其过程同http2 filter有些雷同，后续在讲解http2 filter时，再来讲解这一块。
+
+在创建stream_成功后，也即此时同server连接成功，会调用GrpcMuxImpl::onStreamEstablished()接口，其实现如下
+
+```c++
+void GrpcMuxImpl::onStreamEstablished() {
+  first_stream_request_ = true;
+  for (const auto& type_url : subscriptions_) {
+    queueDiscoveryRequest(type_url);
+  }
+}
+
+```
+
+上述会将订阅的资源request依次通过grpc stream发送到server端。
+
+上述queueDiscoveryRequest接口 最终会调用GrpcMuxImpl::sendDiscoveryRequest接口，其实现如下
+
+```c++
+void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
+  // ......
+  ApiState& api_state = api_state_[type_url];
+  // ....
+
+  auto& request = api_state.request_;
+  request.mutable_resource_names()->Clear();
+
+  // Maintain a set to avoid dupes.
+  std::unordered_set<std::string> resources;
+  for (const auto* watch : api_state.watches_) {
+    for (const std::string& resource : watch->resources_) {
+      if (resources.count(resource) == 0) {
+        resources.emplace(resource);
+        request.add_resource_names(resource);
+      }
+    }
+  }
+
+  if (skip_subsequent_node_ && !first_stream_request_) {
+    request.clear_node();
+  }
+  VersionConverter::prepareMessageForGrpcWire(request, transport_api_version_);
+  ENVOY_LOG(trace, "Sending DiscoveryRequest for {}: {}", type_url, request.DebugString());
+  grpc_stream_.sendMessage(request);
+  first_stream_request_ = false;
+
+  // clear error_detail after the request is sent if it exists.
+  if (api_state_[type_url].request_.has_error_detail()) {
+    api_state_[type_url].request_.clear_error_detail();
+  }
+}
+
+```
+
+该函数具体实现
+
+- 获得api_state_ map中相应type_url（资源类型)的对应watch列表
+
+- 将所有订阅的资源都塞到同一个request中
+
+- 只有第一个request携带node id，后续request均不带node id
+
+- 将transport_api_version_合并到request中
+
+- 调用grpc_stream_的sendMessage接口发送request
+
+- 清空相应的error_detail的内容
+
+至此，将CDS订阅资源的请求流程梳理完毕。
+
+## 资源更新
+
+
+
