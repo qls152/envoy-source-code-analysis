@@ -198,7 +198,7 @@ const std::string& system_version_info) override;
 
 本部分讲解Sotw协议变体时，envoy中xds相关的核心实现，也即CdsApiImpl中subscription_的初始化。
 
-subscription_的初始化时刻在CdsApiImpl的构造函数中，其位于source/common/upstream/cds_api_impl.cc，有如下实现
+subscription_的初始化时刻在CdsApiImpl的构造函数中，其位于source/common/upstream/cds_api_impl.cc，有如下实现
 
 ```c++
 subscription_ = cm_.subscriptionFactory().subscriptionFromConfigSource(
@@ -216,6 +216,7 @@ SubscriptionPtr SubscriptionFactoryImpl::subscriptionFromConfigSource(
 ```
 
 上述参数说明如下：
+
 **config:** 配置文件中的ConfigSource配置选项
 
 **type_url:** 资源类型，其构造过程在CdsApiImpl构造函数中，具体实现如下
@@ -331,5 +332,67 @@ Protobuf::DescriptorPool::generated_pool()，该接口的功能可参考[generat
 
 [FindMethodByName](https://developers.google.com/protocol-buffers/docs/reference/cpp/google.protobuf.descriptor)
 
----------------------
-回到GrpcMuxImpl初始化
+
+回到GrpcMuxImpl初始化, 该实例的构造函数较短，故将其实现粘贴如下
+
+```c++
+GrpcMuxImpl::GrpcMuxImpl(const LocalInfo::LocalInfo& local_info,
+                         Grpc::RawAsyncClientPtr async_client, Event::Dispatcher& dispatcher,
+                         const Protobuf::MethodDescriptor& service_method,
+                         envoy::config::core::v3::ApiVersion transport_api_version,
+                         Runtime::RandomGenerator& random, Stats::Scope& scope,
+                         const RateLimitSettings& rate_limit_settings, bool skip_subsequent_node)
+    : grpc_stream_(this, std::move(async_client), service_method, random, dispatcher, scope,
+                   rate_limit_settings),
+      local_info_(local_info), skip_subsequent_node_(skip_subsequent_node),
+      first_stream_request_(true), transport_api_version_(transport_api_version) {
+  Config::Utility::checkLocalInfo("ads", local_info);
+}
+```
+
+上述部分说明如下
+
+**skip_subsequent_node_:** [xDS REST and gRPC protocol](https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol#basic-protocol-overview) 在**Basic Protocol Overview**部分有如下描述
+
+> Only the first request on a stream is guaranteed to
+> carry the node identifier. The subsequent discovery
+> requests on the same stream may carry an empty node 
+> identifier. This holds true regardless of the
+> acceptance of the discovery responses on the same 
+> stream. The node identifier should always be identical  
+> if present more than once on the stream. It is 
+> sufficient to only check the first message for the 
+> node identifier as a result.
+
+该变量便是用来保证后续XDS request不携带node id标识符。
+
+**transport_api_version_:** 该变量便是[xDS REST and gRPC protocol](https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol#basic-protocol-overview)中**Transport API version**，该变量表示 资源类型的版本，譬如资源类型是否是V3，V2甚至V4等。
+
+**grpc_stream_:** 其同XDS server通信，发送和接收相应的 DiscoveryRequest 和 DiscoveryResponse. 
+
+grpc_stream_的构造函数位于source/common/config/grpc_stream.h，其构造函数声明为
+
+```c++
+GrpcStream(GrpcStreamCallbacks<ResponseProto>* callbacks, Grpc::RawAsyncClientPtr async_client,
+             const Protobuf::MethodDescriptor& service_method, Runtime::RandomGenerator& random,
+             Event::Dispatcher& dispatcher, Stats::Scope& scope,
+             const RateLimitSettings& rate_limit_settings)
+```
+
+在GrpcStream的构造函数中会初始化其成员变量async_client_，该变量的声明如下
+
+```c++
+Grpc::AsyncClient<RequestProto, ResponseProto> async_client_;
+```
+其构造函数声明位于source/common/grpc/typed_async_client.h，定义如下
+
+```c++
+AsyncClient() = default;
+AsyncClient(RawAsyncClientPtr&& client) : client_(std::move(client)) {}
+```
+
+至此初步将CDS初始化流程讲解完毕。
+
+其初始化过程汇总如下
+
+![](./images/xds4.png)
