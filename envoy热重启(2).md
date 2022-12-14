@@ -316,6 +316,297 @@ Envoy中创建共享内存的实现，其主要是利用posix标准提供的创�
 
 至此，Envoy中共享内存的初始化完成。
 
+## 热重启工作流程
+
+理解热重启在envoy中是如何工作的，依然需要从两个进程的视角来分析相应的源码，也即文章开始的**进程1** 和 **进程2**。其中 **进程2**为重新启动的进程，也即热重启的进程。在其HotRestartImpl实例初始化完成后，在位于source/server/server.cc的InstanceImpl::InstanceImpl构造函数中，有如下实现
+
+```c++
+restarter_.initialize(*dispatcher_, *this);
+```
+
+上述会调用位于source/server/hot_restart_impl.cc的HotRestartImpl::initialize函数，其会调用位于source/server/hot_restarting_parent.cc的HotRestartingParent::initialize函数，其实现如下
+
+```c++
+void HotRestartingParent::initialize(Event::Dispatcher& dispatcher, Server::Instance& server) {
+  socket_event_ = dispatcher.createFileEvent(
+      myDomainSocket(),
+      [this](uint32_t events) -> void {
+        ASSERT(events == Event::FileReadyType::Read);
+        onSocketEvent();
+      },
+      Event::FileTriggerType::Edge, Event::FileReadyType::Read);
+  internal_ = std::make_unique<Internal>(&server);
+}
+```
+上述会初始化socket_event_成员变量. 理解此代码需要转换到**进程1**的视角，在**进程1**中，该部分会初始化HotRestartingParent的socket_event_, 其通过dispatcher的createFileEvent函数初始化，关于dispatcher以及相应的event会放到下部分讲解。
+
+socket_event_的作用：监听**进程1**的uds，当其上有数据可读时，调用相应的HotRestartingParent::onSocketEvent()函数。
+
+相应的热重启逻辑均在该函数中，其实现如下所示
+```c++
+void HotRestartingParent::onSocketEvent() {
+  std::unique_ptr<HotRestartMessage> wrapped_request;
+  while ((wrapped_request = receiveHotRestartMessage(Blocking::No))) {
+    if (wrapped_request->requestreply_case() == HotRestartMessage::kReply) {
+      ENVOY_LOG(error, "child sent us a HotRestartMessage reply (we want requests); ignoring.");
+      HotRestartMessage wrapped_reply;
+      wrapped_reply.set_didnt_recognize_your_last_message(true);
+      sendHotRestartMessage(child_address_, wrapped_reply);
+      continue;
+    }
+    switch (wrapped_request->request().request_case()) {
+    case HotRestartMessage::Request::kShutdownAdmin: {
+      sendHotRestartMessage(child_address_, internal_->shutdownAdmin());
+      break;
+    }
+
+    case HotRestartMessage::Request::kPassListenSocket: {
+      sendHotRestartMessage(child_address_,
+                            internal_->getListenSocketsForChild(wrapped_request->request()));
+      break;
+    }
+
+    case HotRestartMessage::Request::kStats: {
+      HotRestartMessage wrapped_reply;
+      internal_->exportStatsToChild(wrapped_reply.mutable_reply()->mutable_stats());
+      sendHotRestartMessage(child_address_, wrapped_reply);
+      break;
+    }
+
+    case HotRestartMessage::Request::kDrainListeners: {
+      internal_->drainListeners();
+      break;
+    }
+
+    case HotRestartMessage::Request::kTerminate: {
+      ENVOY_LOG(info, "shutting down due to child request");
+      kill(getpid(), SIGTERM);
+      break;
+    }
+
+    default: {
+      ENVOY_LOG(error, "child sent us an unfamiliar type of HotRestartMessage; ignoring.");
+      HotRestartMessage wrapped_reply;
+      wrapped_reply.set_didnt_recognize_your_last_message(true);
+      sendHotRestartMessage(child_address_, wrapped_reply);
+      break;
+    }
+    }
+  }
+}
+
+```
+关于该函数的实现内容，在后续**进程1**，**进程2**的热重启交互中进行相应分析。
+
+在HotRestartImpl::initialize完成后，在source/server/server.cc的InstanceImpl::initialize的函数中会有如下实现
+
+```c++
+// Learn original_start_time_ if our parent is still around to inform us of it.
+  restarter_.sendParentAdminShutdownRequest(original_start_time_);
+```
+
+此刻需要以**进程2**的视角来看该语句，上述会调用HotRestartImpl::sendParentAdminShutdownRequest函数，其实现如下
+```c++
+void HotRestartImpl::sendParentAdminShutdownRequest(time_t& original_start_time) {
+  as_child_.sendParentAdminShutdownRequest(original_start_time);
+}
+```
+上述会调用位于source/server/hot_restarting_child.cc的HotRestartingChild::sendParentAdminShutdownRequest函数，
+其实现如下
+
+```c++
+void HotRestartingChild::sendParentAdminShutdownRequest(time_t& original_start_time) {
+  if (restart_epoch_ == 0 || parent_terminated_) {
+    return;
+  }
+
+  HotRestartMessage wrapped_request;
+  wrapped_request.mutable_request()->mutable_shutdown_admin();
+  sendHotRestartMessage(parent_address_, wrapped_request);
+
+  std::unique_ptr<HotRestartMessage> wrapped_reply = receiveHotRestartMessage(Blocking::Yes);
+  RELEASE_ASSERT(replyIsExpectedType(wrapped_reply.get(), HotRestartMessage::Reply::kShutdownAdmin),
+                 "Hot restart parent did not respond as expected to ShutdownParentAdmin.");
+  original_start_time = wrapped_reply->reply().shutdown_admin().original_start_time_unix_seconds();
+}
+
+```
+
+上述函数实现如下功能：
+
+- 若进程2为第一个进程，或者进程1已经终止，则不发送request
+
+- 调用sendHotRestartMessage函数，向进程1发送shut down admin消息
+
+- 调用receiveHotRestartMessage函数，解析进程1的reply 
+
+sendHotRestartMessage函数实现如下
+
+```c++
+void HotRestartingBase::sendHotRestartMessage(sockaddr_un& address,
+                                              const HotRestartMessage& proto) {
+  const uint64_t serialized_size = proto.ByteSizeLong();
+  const uint64_t total_size = sizeof(uint64_t) + serialized_size;
+  // Fill with uint64_t 'length' followed by the serialized HotRestartMessage.
+  std::vector<uint8_t> send_buf;
+  send_buf.resize(total_size);
+  *reinterpret_cast<uint64_t*>(send_buf.data()) = htobe64(serialized_size);
+  RELEASE_ASSERT(proto.SerializeWithCachedSizesToArray(send_buf.data() + sizeof(uint64_t)),
+                 "failed to serialize a HotRestartMessage");
+
+  RELEASE_ASSERT(fcntl(my_domain_socket_, F_SETFL, 0) != -1,
+                 fmt::format("Set domain socket blocking failed, errno = {}", errno));
+
+  uint8_t* next_byte_to_send = send_buf.data();
+  uint64_t sent = 0;
+  while (sent < total_size) {
+    const uint64_t cur_chunk_size = std::min(MaxSendmsgSize, total_size - sent);
+    iovec iov[1];
+    iov[0].iov_base = next_byte_to_send;
+    iov[0].iov_len = cur_chunk_size;
+    next_byte_to_send += cur_chunk_size;
+    sent += cur_chunk_size;
+    msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_name = &address;
+    message.msg_namelen = sizeof(address);
+    message.msg_iov = iov;
+    message.msg_iovlen = 1;
+
+    // Control data stuff, only relevant for the fd passing done with PassListenSocketReply.
+    uint8_t control_buffer[CMSG_SPACE(sizeof(int))];
+    if (replyIsExpectedType(&proto, HotRestartMessage::Reply::kPassListenSocket) &&
+        proto.reply().pass_listen_socket().fd() != -1) {
+      memset(control_buffer, 0, CMSG_SPACE(sizeof(int)));
+      message.msg_control = control_buffer;
+      message.msg_controllen = CMSG_SPACE(sizeof(int));
+      cmsghdr* control_message = CMSG_FIRSTHDR(&message);
+      control_message->cmsg_level = SOL_SOCKET;
+      control_message->cmsg_type = SCM_RIGHTS;
+      control_message->cmsg_len = CMSG_LEN(sizeof(int));
+      *reinterpret_cast<int*>(CMSG_DATA(control_message)) = proto.reply().pass_listen_socket().fd();
+      ASSERT(sent == total_size, "an fd passing message was too long for one sendmsg().");
+    }
+
+    const int rc = sendmsg(my_domain_socket_, &message, 0);
+    RELEASE_ASSERT(rc == static_cast<int>(cur_chunk_size),
+                   fmt::format("hot restart sendmsg() failed: returned {}, errno {}", rc, errno));
+  }
+  RELEASE_ASSERT(fcntl(my_domain_socket_, F_SETFL, O_NONBLOCK) != -1,
+                 fmt::format("Set domain socket nonblocking failed, errno = {}", errno));
+}
+
+```
+
+该函数工作流程如下
+
+- 初始化发送buf
+
+- fcntl(my_domain_socket_, F_SETFL, 0),设置进程2的uds 为block
+
+- 通过uds发送相关的msg，其中若message为PassListenSocketReply，则设置相应的control msg，关于uds相关控制msg的解释可参考:[cmsg_space](https://linux.die.net/man/3/cmsg_space) 以及 [Understanding the msghdr structure from sys/socket.h](https://stackoverflow.com/questions/32593697/understanding-the-msghdr-structure-from-sys-socket-h)
+
+- 调用sendmsg向进程1发送msg
+
+- fcntl(my_domain_socket_, F_SETFL, O_NONBLOCK) 将进程2的uds设置为非block
+
+关于receiveHotRestartMessage(Blocking::Yes)函数的讲解，本文不再赘述。
+
+当进程2通过uds发送消息后，来看看进程1是如何处理相应的逻辑的。
+
+此时进程1会调用HotRestartingParent::onSocketEvent()函数，在该函数中走到如下语句
+```c++
+switch (wrapped_request->request().request_case()) {
+    case HotRestartMessage::Request::kShutdownAdmin: {
+      sendHotRestartMessage(child_address_, internal_->shutdownAdmin());
+      break;
+    }
+```
+也即此时进程1通过解析进程2发送的request的类型知道此request是要求进程1 关闭其admin接口，故上述会首先调用位于source/server/hot_restarting_parent.cc的HotRestartingParent::Internal::shutdownAdmin()函数，其实现如下
+```c++
+HotRestartMessage HotRestartingParent::Internal::shutdownAdmin() {
+  server_->shutdownAdmin();
+  HotRestartMessage wrapped_reply;
+  wrapped_reply.mutable_reply()->mutable_shutdown_admin()->set_original_start_time_unix_seconds(
+      server_->startTimeFirstEpoch());
+  return wrapped_reply;
+}
+```
+该函数会调用位于source/server/server.cc的InstanceImpl::shutdownAdmin()函数，其中会重置flush_stats_timer,以及关闭相应的admin, 具体讲解会在后续部分讲解连接关闭相关的源码分析。
+
+然后该函数会将进程1的启动至此的时间转换成unix时间戳发送给进程2.
+
+至此，第一轮交互完成。
+
+**关于传递Stats和shutdown 请求的交互流程本文不再讲解。下面来看一下Envoy中热重启如何传递listen fd的流程。**
+
+这部分逻辑涉及到Listener初始化以及Socket初始化部分，本部分会在后续讲解，本文主要讲解热重启如何获得进程1的listen fd的。该部分逻辑入口位于source/server/listener_manager_impl.cc中的ProdListenerComponentFactory::createListenSocket函数，其有部分如下实现
+```c++
+    const int fd = server_.hotRestart().duplicateParentListenSocket(addr);
+```
+
+理解上述逻辑需要先从进程2的视角出发，上述会调用位于source/server/hot_restart_impl.cc的HotRestartImpl::duplicateParentListenSocket函数，其会调用位于source/server/hot_restarting_child.cc的 HotRestartingChild::duplicateParentListenSocket函数，该函数实现如下
+```c++
+int HotRestartingChild::duplicateParentListenSocket(const std::string& address) {
+  if (restart_epoch_ == 0 || parent_terminated_) {
+    return -1;
+  }
+
+  HotRestartMessage wrapped_request;
+  wrapped_request.mutable_request()->mutable_pass_listen_socket()->set_address(address);
+  sendHotRestartMessage(parent_address_, wrapped_request);
+
+  std::unique_ptr<HotRestartMessage> wrapped_reply = receiveHotRestartMessage(Blocking::Yes);
+  if (!replyIsExpectedType(wrapped_reply.get(), HotRestartMessage::Reply::kPassListenSocket)) {
+    return -1;
+  }
+  return wrapped_reply->reply().pass_listen_socket().fd();
+}
+```
+相关逻辑可参考热重启第一次交互相关源码讲解，此处不在赘述。
+
+当进程2发送request成功后，进程1会调用 HotRestartingParent::onSocketEvent()函数，执行如下部分代码
+```c++
+case HotRestartMessage::Request::kPassListenSocket: {
+      sendHotRestartMessage(child_address_,
+                            internal_->getListenSocketsForChild(wrapped_request->request()));
+      break;
+    }
+```
+上述会先调用HotRestartingParent::Internal::getListenSocketsForChild函数，其实现如下所示
+```c++
+HotRestartMessage
+HotRestartingParent::Internal::getListenSocketsForChild(const HotRestartMessage::Request& request) {
+  HotRestartMessage wrapped_reply;
+  wrapped_reply.mutable_reply()->mutable_pass_listen_socket()->set_fd(-1);
+  Network::Address::InstanceConstSharedPtr addr =
+      Network::Utility::resolveUrl(request.pass_listen_socket().address());
+  for (const auto& listener : server_->listenerManager().listeners()) {
+    Network::ListenSocketFactory& socket_factory = listener.get().listenSocketFactory();
+    if (*socket_factory.localAddress() == *addr && listener.get().bindToPort()) {
+      if (socket_factory.sharedSocket().has_value()) {
+        // Pass the socket to the new process iff it is already shared across workers.
+        wrapped_reply.mutable_reply()->mutable_pass_listen_socket()->set_fd(
+            socket_factory.sharedSocket()->get().ioHandle().fd());
+      }
+      break;
+    }
+  }
+  return wrapped_reply;
+}
+```
+**在envoy中，能够在热重启中传递的fd必须为非reuse_port的fd**。
+
+关于该部分的讲解，会在讲解完listener初始化后补全。
+
+## 总结
+
+本文针对envoy中热重启的源码实现进行了相应的分析。
+
+
+
+
+
 
 
 
