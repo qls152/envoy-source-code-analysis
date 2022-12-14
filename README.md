@@ -17,3 +17,5 @@
 [envoyproxy/envoy](https://github.com/envoyproxy/envoy/blob/main/bazel/README.md)
 
 [envoy官方文档](https://www.envoyproxy.io/docs/envoy/latest/start/start)
+
+[Fast portable non-blocking network programming with Libevent](http://www.wangafu.net/~nickm/libevent-book/TOC.html)
